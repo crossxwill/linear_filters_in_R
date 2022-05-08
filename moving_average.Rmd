@@ -17,14 +17,12 @@ library(stargazer)
 Suppose $y$ is a linear function of $x_1$ and random error:
 
 $$y = \beta_0 + \beta_1 x_1 + \epsilon$$
-The linear relationship is simulated below with deterministic values for $x_1$:
-
 ```{r}
 set.seed(1)
 
 nobs <- 1000
 
-x1 <- log(1:nobs)
+x1 <- log(1:nobs) + rnorm(nobs, 0, 0.25)
 y <- 2 + 3 * x1 + rnorm(nobs)
 
 df <- data.frame(t=1:nobs, y=y, x1=x1)
@@ -154,3 +152,90 @@ stargazer(true_model, noisy_model, ma_model, ma_ctr_model,
 
 )
 ```
+
+## Optimal Filter via 5-fold CV MSE
+
+The hyper-parameter `k_param` controls the smoothness of the `ma` predictor. We could choose the optimal `k_param` by trying different values and measuring the 5-fold cross-validation error for each value. The code below finds the optimal `k_param` for the backward-looking moving average.
+
+```{r}
+cv_5_fold <- function(dataframe, ma_window){
+
+  dataframe[,'x1_noisy_ma'] <- stats::filter(x=ts(dataframe[,'x1_noisy']),
+                                 filter=rep(1/ma_window, ma_window),
+                                 method="convolution",
+                                 sides=1)  
+  
+  train <- dataframe %>% drop_na()
+
+  mod <- glm(y ~ x1_noisy_ma, data=train)
+  
+  set.seed(123)
+
+  cv_mod <- boot::cv.glm(train, mod, K=5)
+
+  return(data.frame(ma_window=ma_window, MSE=cv_mod$delta[1]))
+}
+```
+
+Let's try the moving average windows from 2 to 120 (in increments of 2):
+
+```{r}
+tuning_ma_window <- lapply(seq(2,120,2), function(x){
+  cv_5_fold(dataframe=df, ma_window=x)
+})
+
+tuning_ma_window_df <- bind_rows(tuning_ma_window)
+```
+
+Plot the window against 5-fold CV MSE:
+
+```{r}
+ggplot(tuning_ma_window_df, aes(x=ma_window,y=MSE)) +
+  geom_line() +
+  ylab("5-fold CV MSE") +
+  theme_bw()
+```
+
+There does not appear to be a meaningful change in CV MSE after `k=24`. Hence, we choose 24 as the optimal moving average window.
+
+```{r}
+k_param <- 24
+
+df$x1_noisy_ma_cv <- stats::filter(x=ts(df$x1_noisy),
+                                 filter=rep(1/k_param, k_param),
+                                 method="convolution",
+                                 sides=1)
+
+df_filtered_cv <- df %>% drop_na()
+
+df_long_cv <- pivot_longer(df_filtered_cv, -t) %>%
+  filter(name %in%  c('x1','x1_noisy', 'x1_noisy_ma', 'x1_noisy_ma_cv'))
+
+ggplot(df_long_cv, aes(x=t, y=value, group=name, color=name)) +
+  geom_line(aes(linetype=name)) +
+  scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
+  scale_color_manual(values=c('black', 'green', 'purple', 'magenta')) +
+  theme_bw()
+
+ma_model_cv <- lm(y ~ x1_noisy_ma_cv, data=df_filtered_cv)
+
+
+```
+
+```{r echo=FALSE, results='asis'}
+stargazer(true_model, noisy_model, ma_model, ma_model_cv,
+          title="True, Noisy, and Filtered Predictors",
+          type = "latex",
+          float = FALSE,
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          single.row = FALSE,
+          font.size = "small",
+          intercept.bottom = F,
+          digits = 3, omit.stat=c("f")
+
+)
+```
+
+
