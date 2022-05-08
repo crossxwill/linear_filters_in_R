@@ -1,0 +1,156 @@
+---
+title: "Moving Averages in R"
+author: "William Chiu"
+date: "5/7/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(stargazer)
+```
+
+## Data and Noise
+
+Suppose $y$ is a linear function of $x_1$ and random error:
+
+$$y = \beta_0 + \beta_1 x_1 + \epsilon$$
+The linear relationship is simulated below with deterministic values for $x_1$:
+
+```{r}
+set.seed(1)
+
+nobs <- 1000
+
+x1 <- log(1:nobs)
+y <- 2 + 3 * x1 + rnorm(nobs)
+
+df <- data.frame(t=1:nobs, y=y, x1=x1)
+
+rm(x1, y)
+```
+
+But also suppose that $x_1$ is not directly observable, instead we observe its noiser cousin that contains random errors. For example, the instrument that measures $x_1$ suffers from random imprecision.
+
+```{r}
+df$x1_noisy <- df$x1 + rnorm(nobs,0)
+```
+
+Since $x_1$ is observed with noisy imprecision, this degrades the OLS fit.
+
+```{r}
+true_model <- lm(y ~ x1, data=df)
+
+noisy_model <- lm(y ~ x1_noisy, data=df)
+
+```
+
+```{r echo=FALSE, results='asis'}
+stargazer(true_model, noisy_model,
+          title="True and Noisy Predictors",
+          type = "latex",
+          float = FALSE,
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          single.row = FALSE,
+          font.size = "small",
+          intercept.bottom = F,
+          digits = 3, omit.stat=c("f")
+)
+```
+
+## Visualization
+
+Plot $x_1$ and $x_1^{noisy}$ over time.
+
+```{r}
+df_long <- pivot_longer(df, -t) %>% filter(name %in% c('x1','x1_noisy'))
+
+ggplot(df_long, aes(x=t, y=value, group=name, color=name)) +
+  geom_line(aes(linetype=name)) +
+  scale_linetype_manual(values=c("solid", "dashed"))+
+  scale_color_manual(values=c('black', 'green')) +
+  theme_bw()
+```
+
+
+
+## Filter and Moving Averages
+
+We could apply a filter on $x_1^{noisy}$ to remove some of the "jumpiness". First, we apply a backward-looking moving average with a k-period window:
+
+```{r}
+k_param <- 12
+
+df$x1_noisy_ma <- stats::filter(x=ts(df$x1_noisy),
+                                 filter=rep(1/k_param, k_param),
+                                 method="convolution",
+                                 sides=1)
+
+knitr::kable(head(df, k_param+5))
+```
+
+Second, we apply a "centered" moving average that includes both past and future periods.
+
+
+```{r}
+df$x1_noisy_ma_ctr <- stats::filter(x=ts(df$x1_noisy),
+                                 filter=rep(1/k_param, k_param),
+                                 method="convolution",
+                                 sides=2)
+
+knitr::kable(head(df, k_param+5))
+```
+
+The filters created `NA` values that should be removed before refitting the models.
+
+```{r}
+df_filtered <- df %>% drop_na()
+
+knitr::kable(head(df_filtered))
+```
+
+
+
+## More Visualization
+
+Plot $x_1$, $x_1^{noisy}$, and the filtered predictors  over time.
+
+```{r}
+df_long2 <- pivot_longer(df_filtered, -t) %>%
+  filter(name %in%  c('x1','x1_noisy', 'x1_noisy_ma', 'x1_noisy_ma_ctr'))
+
+ggplot(df_long2, aes(x=t, y=value, group=name, color=name)) +
+  geom_line(aes(linetype=name)) +
+  scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
+  scale_color_manual(values=c('black', 'green', 'purple', 'magenta')) +
+  theme_bw()
+```
+
+## Refit models with MA predictors
+
+```{r}
+ma_model <- lm(y ~ x1_noisy_ma, data=df_filtered)
+
+ma_ctr_model <- lm(y ~ x1_noisy_ma_ctr, data=df_filtered)
+
+```
+
+```{r echo=FALSE, results='asis'}
+stargazer(true_model, noisy_model, ma_model, ma_ctr_model,
+          title="True, Noisy, and Filtered Predictors",
+          type = "latex",
+          float = FALSE,
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          single.row = FALSE,
+          font.size = "small",
+          intercept.bottom = F,
+          digits = 3, omit.stat=c("f")
+
+)
+```
