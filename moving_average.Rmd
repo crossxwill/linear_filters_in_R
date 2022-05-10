@@ -10,38 +10,40 @@ knitr::opts_chunk$set(echo = TRUE)
 
 library(tidyverse)
 library(stargazer)
+library(forecast)
 ```
 
 ## Data and Noise
 
-Suppose $y$ is a linear function of $x_1$ and random error:
+Suppose $y_t$ is a linear function of $x_t$ and random error:
 
-$$y = \beta_0 + \beta_1 x_1 + \epsilon$$
+$$y = \beta_0 + \beta_1 x_t + \epsilon$$
+
 ```{r}
 set.seed(1)
 
 nobs <- 1000
 
-x1 <- log(1:nobs) + rnorm(nobs, 0, 0.25)
-y <- 2 + 3 * x1 + rnorm(nobs)
+x <- log(1:nobs) + rnorm(nobs, 0, 0.25)
+y <- 2 + 3 * x + rnorm(nobs)
 
-df <- data.frame(t=1:nobs, y=y, x1=x1)
+df <- data.frame(t=1:nobs, y=y, x=x)
 
-rm(x1, y)
+rm(x, y)
 ```
 
-But also suppose that $x_1$ is not directly observable, instead we observe its noiser cousin that contains random errors. For example, the instrument that measures $x_1$ suffers from random imprecision.
+But also suppose that $x_t$ is not directly observable, instead we observe its noiser cousin that contains random errors. For example, the instrument that measures $x_t$ suffers from random imprecision.
 
 ```{r}
-df$x1_noisy <- df$x1 + rnorm(nobs,0)
+df$x_noisy <- df$x + rnorm(nobs,0)
 ```
 
-Since $x_1$ is observed with noisy imprecision, this degrades the OLS fit.
+Since $x_t$ is observed with noisy imprecision, this degrades the OLS fit.
 
 ```{r}
-true_model <- lm(y ~ x1, data=df)
+true_model <- lm(y ~ x, data=df)
 
-noisy_model <- lm(y ~ x1_noisy, data=df)
+noisy_model <- lm(y ~ x_noisy, data=df)
 
 ```
 
@@ -62,28 +64,27 @@ stargazer(true_model, noisy_model,
 
 ## Visualization
 
-Plot $x_1$ and $x_1^{noisy}$ over time.
+Plot $x_t$ and $x_t^{noisy}$ over time.
 
 ```{r}
-df_long <- pivot_longer(df, -t) %>% filter(name %in% c('x1','x1_noisy'))
+df_long <- pivot_longer(df, -t) %>% filter(name %in% c('x','x_noisy'))
 
-ggplot(df_long, aes(x=t, y=value, group=name, color=name)) +
+ggplot(df_long, aes(x=t, y=value, group=name, color=name, alpha=name)) +
   geom_line(aes(linetype=name)) +
   scale_linetype_manual(values=c("solid", "dashed"))+
   scale_color_manual(values=c('black', 'green')) +
+  scale_alpha_manual(values=c(1, 0.25)) + 
   theme_bw()
 ```
 
-
-
 ## Filter and Moving Averages
 
-We could apply a filter on $x_1^{noisy}$ to remove some of the "jumpiness". First, we apply a backward-looking moving average with a k-period window:
+We could apply a filter on $x_t^{noisy}$ to remove some of the "jumpiness". First, we apply a backward-looking moving average with a k-period window:
 
 ```{r}
 k_param <- 12
 
-df$x1_noisy_ma <- stats::filter(x=ts(df$x1_noisy),
+df$x_noisy_ma <- stats::filter(x=ts(df$x_noisy),
                                  filter=rep(1/k_param, k_param),
                                  method="convolution",
                                  sides=1)
@@ -93,9 +94,8 @@ knitr::kable(head(df, k_param+5))
 
 Second, we apply a "centered" moving average that includes both past and future periods.
 
-
 ```{r}
-df$x1_noisy_ma_ctr <- stats::filter(x=ts(df$x1_noisy),
+df$x_noisy_ma_ctr <- stats::filter(x=ts(df$x_noisy),
                                  filter=rep(1/k_param, k_param),
                                  method="convolution",
                                  sides=2)
@@ -111,29 +111,28 @@ df_filtered <- df %>% drop_na()
 knitr::kable(head(df_filtered))
 ```
 
-
-
 ## More Visualization
 
-Plot $x_1$, $x_1^{noisy}$, and the filtered predictors  over time.
+Plot $x_t$, $x_t^{noisy}$, and the filtered predictors over time.
 
 ```{r}
 df_long2 <- pivot_longer(df_filtered, -t) %>%
-  filter(name %in%  c('x1','x1_noisy', 'x1_noisy_ma', 'x1_noisy_ma_ctr'))
+  filter(name %in%  c('x','x_noisy', 'x_noisy_ma', 'x_noisy_ma_ctr'))
 
-ggplot(df_long2, aes(x=t, y=value, group=name, color=name)) +
+ggplot(df_long2, aes(x=t, y=value, group=name, color=name, alpha=name)) +
   geom_line(aes(linetype=name)) +
   scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
-  scale_color_manual(values=c('black', 'green', 'purple', 'magenta')) +
+  scale_color_manual(values=c('black', 'green', 'purple', 'blue')) +
+  scale_alpha_manual(values = c(0.25, 0.25, 0.75, 1)) +
   theme_bw()
 ```
 
 ## Refit models with MA predictors
 
 ```{r}
-ma_model <- lm(y ~ x1_noisy_ma, data=df_filtered)
+ma_model <- lm(y ~ x_noisy_ma, data=df_filtered)
 
-ma_ctr_model <- lm(y ~ x1_noisy_ma_ctr, data=df_filtered)
+ma_ctr_model <- lm(y ~ x_noisy_ma_ctr, data=df_filtered)
 
 ```
 
@@ -160,14 +159,14 @@ The hyper-parameter `k_param` controls the smoothness of the `ma` predictor. We 
 ```{r}
 cv_5_fold <- function(dataframe, ma_window){
 
-  dataframe[,'x1_noisy_ma'] <- stats::filter(x=ts(dataframe[,'x1_noisy']),
+  dataframe[,'x_noisy_ma'] <- stats::filter(x=ts(dataframe[,'x_noisy']),
                                  filter=rep(1/ma_window, ma_window),
                                  method="convolution",
                                  sides=1)  
   
   train <- dataframe %>% drop_na()
 
-  mod <- glm(y ~ x1_noisy_ma, data=train)
+  mod <- glm(y ~ x_noisy_ma, data=train)
   
   set.seed(123)
 
@@ -201,7 +200,7 @@ There does not appear to be a meaningful change in CV MSE after `k=24`. Hence, w
 ```{r}
 k_param <- 24
 
-df$x1_noisy_ma_cv <- stats::filter(x=ts(df$x1_noisy),
+df$x_noisy_ma_cv <- stats::filter(x=ts(df$x_noisy),
                                  filter=rep(1/k_param, k_param),
                                  method="convolution",
                                  sides=1)
@@ -209,15 +208,16 @@ df$x1_noisy_ma_cv <- stats::filter(x=ts(df$x1_noisy),
 df_filtered_cv <- df %>% drop_na()
 
 df_long_cv <- pivot_longer(df_filtered_cv, -t) %>%
-  filter(name %in%  c('x1','x1_noisy', 'x1_noisy_ma', 'x1_noisy_ma_cv'))
+  filter(name %in%  c('x','x_noisy', 'x_noisy_ma', 'x_noisy_ma_cv'))
 
-ggplot(df_long_cv, aes(x=t, y=value, group=name, color=name)) +
+ggplot(df_long_cv, aes(x=t, y=value, group=name, color=name, alpha=name)) +
   geom_line(aes(linetype=name)) +
   scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
-  scale_color_manual(values=c('black', 'green', 'purple', 'magenta')) +
+  scale_color_manual(values=c('black', 'green', 'purple', 'blue')) +
+  scale_alpha_manual(values=c(0.25, 0.25, 0.75, 1)) +
   theme_bw()
 
-ma_model_cv <- lm(y ~ x1_noisy_ma_cv, data=df_filtered_cv)
+ma_model_cv <- lm(y ~ x_noisy_ma_cv, data=df_filtered_cv)
 
 
 ```
@@ -238,4 +238,70 @@ stargazer(true_model, noisy_model, ma_model, ma_model_cv,
 )
 ```
 
+## Filter and Exponential Smoothing
 
+Moving averages remove jumpiness in a time series. They are easy to calculate and understand. However, they create missing values in the beginning and/or end of the time series.
+
+Simple exponential smoothing (SES) also removes jumpiness but does not create any missing values.
+
+Hyndman explains SES [here](https://otexts.com/fpp2/ses.html) and [here](https://otexts.com/fpp2/ets.html). The smoothing equation is customized to our example:
+
+$$x_t^{ses} = \alpha x_t^{noisy} + (1-\alpha)x_{t-1}^{ses}$$
+If `t=1`, the value of $x_{0}^{ses}$ is not obvious. Fortunately, the `ets` function estimates both $x_{0}^{ses}$ and $\alpha$ using maximum likelihood.
+
+```{r}
+x_ets <- ets(df$x_noisy, "ANN")
+
+coef(x_ets)
+```
+
+The estimate of the smoothing parameter ($\alpha$) is `r coef(x_ets)['alpha']` and the estimate of $x_{0}^{ses}$ is `r coef(x_ets)['l']`.
+
+Notice that the smoothed values do not contain any `NA`.
+
+```{r}
+df$x_noisy_ses <- x_ets$states[-1,1]
+
+knitr::kable(head(df) %>% select(-x_noisy_ma_ctr, -x_noisy_ma))
+```
+
+
+## More Visualization
+
+```{r}
+df_long3 <- pivot_longer(df, -t) %>%
+  filter(name %in%  c('x','x_noisy', 'x_noisy_ma_cv', 'x_noisy_ses'))
+
+ggplot(df_long3, aes(x=t, y=value, group=name, color=name, alpha=name)) +
+  geom_line(aes(linetype=name)) +
+  scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
+  scale_color_manual(values=c('black', 'green', 'purple', 'blue')) +
+  scale_alpha_manual(values=c(0.25, 0.25, 0.75, 1)) +
+  theme_bw()
+```
+
+## Refit Models
+
+```{r}
+ma_model_ets <- lm(y ~ x_noisy_ses, data=df)
+
+```
+
+```{r echo=FALSE, results='asis'}
+stargazer(true_model, noisy_model, ma_model_cv, ma_model_ets,
+          title="True, Noisy, and Filtered Predictors",
+          type = "latex",
+          float = FALSE,
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          single.row = FALSE,
+          font.size = "small",
+          intercept.bottom = F,
+          digits = 3, omit.stat=c("f")
+
+)
+```
+## Conclusion
+
+Filtering a noisy predictor variable ($x_t^{noisy}$) may improve your OLS fit.
