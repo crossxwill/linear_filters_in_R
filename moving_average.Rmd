@@ -1,7 +1,7 @@
 ---
-title: "Moving Averages in R"
+title: "Smoothing for Time Series Regression in R"
 author: "William Chiu"
-date: "5/7/2022"
+date: "5/7/2022" 
 output: pdf_document
 ---
 
@@ -11,6 +11,7 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(stargazer)
 library(forecast)
+library(Metrics)
 ```
 
 ## Data and Noise
@@ -22,12 +23,13 @@ $$y = \beta_0 + \beta_1 x_t + \epsilon$$
 ```{r}
 set.seed(1)
 
+nobsFull <- 1500
 nobs <- 1000
 
-x <- log(1:nobs) + rnorm(nobs, 0, 0.25)
-y <- 2 + 3 * x + rnorm(nobs)
+x <- log(1:nobsFull) + rnorm(nobsFull, 0, 0.25)
+y <- 2 + 3 * x + rnorm(nobsFull)
 
-df <- data.frame(t=1:nobs, y=y, x=x)
+df_full <- data.frame(t=1:nobsFull, y=y, x=x)
 
 rm(x, y)
 ```
@@ -35,7 +37,11 @@ rm(x, y)
 But also suppose that $x_t$ is not directly observable, instead we observe its noiser cousin that contains random errors. For example, the instrument that measures $x_t$ suffers from random imprecision.
 
 ```{r}
-df$x_noisy <- df$x + rnorm(nobs,0)
+df_full$x_noisy <- df_full$x + rnorm(nobsFull,0, 1)
+
+df <- df_full[1:nobs, ]
+
+df_test <- df_full[(nobs + 1):nobsFull,]
 ```
 
 Since $x_t$ is observed with noisy imprecision, this degrades the OLS fit.
@@ -195,10 +201,10 @@ ggplot(tuning_ma_window_df, aes(x=ma_window,y=MSE)) +
   theme_bw()
 ```
 
-There does not appear to be a meaningful change in CV MSE after `k=24`. Hence, we choose 24 as the optimal moving average window.
+There does not appear to be a meaningful change in CV MSE after `k=48`. Hence, we choose 48 as the optimal moving average window.
 
 ```{r}
-k_param <- 24
+k_param <- 48
 
 df$x_noisy_ma_cv <- stats::filter(x=ts(df$x_noisy),
                                  filter=rep(1/k_param, k_param),
@@ -283,12 +289,12 @@ ggplot(df_long3, aes(x=t, y=value, group=name, color=name, alpha=name)) +
 ## Refit Models
 
 ```{r}
-ma_model_ets <- lm(y ~ x_noisy_ses, data=df)
+ets_model <- lm(y ~ x_noisy_ses, data=df)
 
 ```
 
 ```{r echo=FALSE, results='asis'}
-stargazer(true_model, noisy_model, ma_model_cv, ma_model_ets,
+stargazer(true_model, noisy_model, ma_model_cv, ets_model,
           title="True, Noisy, and Filtered Predictors",
           type = "latex",
           float = FALSE,
@@ -302,6 +308,230 @@ stargazer(true_model, noisy_model, ma_model_cv, ma_model_ets,
 
 )
 ```
+
+## Optimal Filter via Time Series CV MSE
+
+The `ets` function estimates $\alpha$ and $x_0$ but ignores the relationship between $x_t$ and $y_t$. Now we will search through a grid of $\alpha$ values to find the optimal value that best fits several hold out data sets.
+
+Ordinary CV is difficult in this case because:
+
+1. The estimate of $\alpha$ depends on a sequence of observations, so random sampling is not appropriate. Compare this to moving averages where the weights are defined by $\frac{1}{k}$ and there are no parameters to estimate.
+
+2. The hold out data set should not be included in the estimation of $\alpha$. The smoothed values of $x_t^{noisy}$ in the hold out set should be calculated from the the training estimate of $\alpha$.
+
+In order to solve these two problems, we use time series cross validation:
+
+1. Partition the training set into 5 sequential slices
+2. Each slice contains 150 observations for training and 50 observations for hold out
+3. Estimate $\alpha$ for each slice and fit a linear model on the sliced training data
+4. Given the estimate of $\alpha$ from step 3, calculate the smoothed predictors, and measure the linear model's hold out MSE
+5. Repeat step 3 and 4 for each slice
+
+Here's the function to calculate the smoothed predictors in the hold out data set. For the SES predictor, the last smoothed value from the training set is needed.
+
+```{r}
+updateSESvalues <- function(etsobj, newdata){
+  
+  lastTrainSmoothVal <- tail(etsobj$states[,1], 1)
+  
+  alpha_est <- coef(etsobj)['alpha']
+  
+  h <- nrow(newdata)
+  
+  for(i in seq.int(h)){
+    if(i==1){
+      newdata[i,'x_noisy_ses'] = alpha_est*newdata[i,'x_noisy'] + (1-alpha_est)*
+        lastTrainSmoothVal
+      
+    } else {
+      newdata[i,'x_noisy_ses'] = alpha_est*newdata[i,'x_noisy'] + (1-alpha_est)*
+        newdata[i-1,'x_noisy_ses'] 
+    }
+  }
+  
+  return(newdata$x_noisy_ses)
+}
+```
+
+Create 5 slices of the training set.
+
+```{r}
+training_slices <- list(slice1=df[1:200,],
+                        slice2=df[201:400,],
+                        slice3=df[401:600,],
+                        slice4=df[601:800,],
+                        slice5=df[801:1000,])
+```
+
+A function that does steps 2-4:
+
+```{r}
+doOneSlice <- function(slice_df, alpha){
+  train_df <- slice_df[1:150,]
+  test_df <- slice_df[151:200,]
+  
+  x_ets_slice <- ets(train_df$x_noisy, "ANN", alpha=alpha)
+
+  train_df$x_noisy_ses <- x_ets_slice$states[-1,1]
+  
+  lm_ets <- lm(y ~ x_noisy_ses, data=train_df)
+  
+  test_df$x_noisy_ses <- updateSESvalues(x_ets_slice, test_df)
+
+  hold_out_preds <- predict(lm_ets, newdata=test_df)
+  
+  return(MSE=mse(test_df$y, hold_out_preds))
+}
+```
+
+A function that runs through all 5 slices and averages the MSE.
+
+```{r}
+doAllSlices <- function(listOfSlices, alpha){
+  
+  allSlices <- sapply(listOfSlices, doOneSlice, alpha=alpha)
+  
+  return(data.frame(alpha=alpha, MSE=mean(allSlices)))
+}
+```
+
+Try $\alpha$ between 0.001 to 0.10 by increments of 0.00198
+
+```{r}
+alphaGridSearch <- lapply(seq(0.001, 0.10, 0.00198), function(x){
+  doAllSlices(listOfSlices = training_slices, alpha=x)
+})
+
+alphaGridSearchdf <- bind_rows(alphaGridSearch)
+
+bestAlpha <- alphaGridSearchdf[which.min(alphaGridSearchdf$MSE), 'alpha']
+
+ggplot(alphaGridSearchdf, aes(x=alpha,y=MSE)) +
+  geom_line() +
+  ylab("Time Series CV MSE") +
+  theme_bw() + geom_vline(xintercept = bestAlpha, linetype="dotted", 
+                color = "blue", size=1.5)
+  
+```
+The optimal estimate of $\alpha$ is `r bestAlpha`.
+
+## Refit Models
+
+```{r}
+x_ets_cv <- ets(df$x_noisy, "ANN", alpha=bestAlpha)
+
+coef(x_ets_cv)
+
+df$x_noisy_ses_cv <- x_ets_cv$states[-1,1]
+
+df_long4 <- pivot_longer(df, -t) %>%
+  filter(name %in%  c('x','x_noisy', 'x_noisy_ses', 'x_noisy_ses_cv'))
+
+ggplot(df_long4, aes(x=t, y=value, group=name, color=name, alpha=name)) +
+  geom_line(aes(linetype=name)) +
+  scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
+  scale_color_manual(values=c('black', 'green', 'purple', 'blue')) +
+  scale_alpha_manual(values=c(0.25, 0.25, 0.75, 1)) +
+  theme_bw()
+```
+
+```{r}
+ets_model_cv <- lm(y ~ x_noisy_ses_cv, data=df)
+
+```
+
+```{r echo=FALSE, results='asis'}
+stargazer(true_model, ma_model_cv, ets_model, ets_model_cv,
+          title="True, Noisy, and Filtered Predictors",
+          type = "latex",
+          float = FALSE,
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          single.row = FALSE,
+          font.size = "small",
+          intercept.bottom = F,
+          digits = 3, omit.stat=c("f")
+
+)
+```
+
+## Test Set Performance
+
+
+Compare the test set performance for the following models:
+
+1. True Predictor Model
+2. Noisy Predictor Model
+3. Moving Average (CV) Predictor Model
+4. Exponential Smoothing (CV) Predictor Model
+
+Predictors for models 3 and 4, need to be computed using the noisy predictor and smoothing parameter estimates.
+
+For the moving average predictor, the last 47 observations from the training set need to be appended to the top of the test set.
+
+```{r}
+df_test_2 <- rbind(tail(df[,names(df_test)],47),
+                   df_test)
+
+df_test_2$x_noisy_ma_cv <- stats::filter(x=ts(df_test_2$x_noisy),
+                                 filter=rep(1/48, 48),
+                                 method="convolution",
+                                 sides=1)
+
+df_test_2 <- df_test_2 %>% drop_na()
+```
+
+For the SES predictor, the last smoothed value from the training set is needed.
+
+```{r}
+
+
+df_test_2$x_noisy_ses_cv <- updateSESvalues(x_ets_cv, df_test)
+
+knitr::kable(head(df_test_2))
+```
+
+Now we can execute the predict using the 4 regression models:
+
+```{r}
+true_x_preds <- predict(true_model, newdata=df_test_2)
+
+noisy_x_preds <- predict(noisy_model, newdata=df_test_2)
+
+ma_x_preds <- predict(ma_model_cv, newdata=df_test_2)
+
+ses_x_preds <- predict(ets_model_cv, newdata=df_test_2)
+
+all_preds <- list(true=true_x_preds,
+                  noisy=noisy_x_preds,
+                  ma=ma_x_preds,
+                  ses=ses_x_preds)
+
+sqrt(sapply(all_preds, function(x){
+  mse(actual=df_test_2$y, predicted=x)
+}))
+```
+
+## Test Set Visualization
+
+```{r}
+df_test_3 <- df_test_2
+
+df_long_test <- pivot_longer(df_test_3, -t) %>%
+  filter(name %in%  c('x','x_noisy', 'x_noisy_ma_cv', 'x_noisy_ses_cv'))
+
+ggplot(df_long_test, aes(x=t, y=value, group=name, color=name, alpha=name)) +
+  geom_line(aes(linetype=name)) +
+  scale_linetype_manual(values=c("solid", "dashed", "solid", "solid"))+
+  scale_color_manual(values=c('black', 'green', 'purple', 'blue')) +
+  scale_alpha_manual(values=c(0.25, 0.25, 0.75, 1)) +
+  theme_bw()
+
+```
+
+
+
 ## Conclusion
 
-Filtering a noisy predictor variable ($x_t^{noisy}$) may improve your OLS fit.
+Filtering a noisy predictor variable ($x_t^{noisy}$) may improve your time series regression model. Moving averages (MA) and simple exponential smoothing (SES) remove jumpiness from time series. The amount of smoothing should be determined by cross validation.
